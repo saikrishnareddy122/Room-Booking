@@ -1,0 +1,193 @@
+pom.xml......
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt</artifactId>
+        <version>0.9.1</version>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.h2database</groupId>
+        <artifactId>h2</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+
+// application.properties
+spring.datasource.url=jdbc:h2:mem:testdb
+spring.h2.console.enabled=true
+spring.jpa.hibernate.ddl-auto=update
+jwt.secret=secret123
+
+// User.java
+@Entity
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class User {
+    @Id @GeneratedValue
+    private Long id;
+    private String username;
+    private String password;
+    private String role; // USER, ADMIN
+}
+
+// RoomBooking.java
+@Entity
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class RoomBooking {
+    @Id @GeneratedValue
+    private Long id;
+    private String roomName;
+    private LocalDate startDate;
+    private LocalDate endDate;
+
+    @ManyToOne
+    private User user;
+}
+
+// UserRepository.java
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByUsername(String username);
+}
+
+// RoomBookingRepository.java
+public interface RoomBookingRepository extends JpaRepository<RoomBooking, Long> {
+    @Query("SELECT b FROM RoomBooking b WHERE b.roomName = :roomName AND " +
+           "((:startDate BETWEEN b.startDate AND b.endDate) OR " +
+           "(:endDate BETWEEN b.startDate AND b.endDate) OR " +
+           "(b.startDate BETWEEN :startDate AND :endDate))")
+    List<RoomBooking> findConflicts(String roomName, LocalDate startDate, LocalDate endDate);
+}
+
+// AuthController.java
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+    @Autowired private UserRepository userRepo;
+    @Autowired private JwtUtil jwtUtil;
+
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@RequestBody AuthRequest req) {
+        User user = userRepo.findByUsername(req.getUsername())
+            .orElseThrow(() -> new UsernameNotFoundException("User not found"));
+        if (!user.getPassword().equals(req.getPassword())) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        String token = jwtUtil.generateToken(user);
+        return ResponseEntity.ok(Map.of("token", token));
+    }
+}
+
+// BookingController.java
+@RestController
+@RequestMapping("/api/bookings")
+public class BookingController {
+    @Autowired private RoomBookingRepository bookingRepo;
+    @Autowired private UserRepository userRepo;
+
+    @PostMapping
+    public ResponseEntity<?> bookRoom(@RequestBody RoomBooking booking, Principal principal) {
+        List<RoomBooking> conflicts = bookingRepo.findConflicts(
+            booking.getRoomName(), booking.getStartDate(), booking.getEndDate()
+        );
+        if (!conflicts.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body("Booking conflict");
+        }
+        User user = userRepo.findByUsername(principal.getName()).get();
+        booking.setUser(user);
+        return ResponseEntity.ok(bookingRepo.save(booking));
+    }
+
+    @GetMapping
+    public List<RoomBooking> getBookings(Principal principal) {
+        return bookingRepo.findAll();
+    }
+}
+
+// JwtUtil.java
+@Component
+public class JwtUtil {
+    @Value("${jwt.secret}")
+    private String secret;
+
+    public String generateToken(User user) {
+        return Jwts.builder()
+            .setSubject(user.getUsername())
+            .claim("role", user.getRole())
+            .setIssuedAt(new Date())
+            .setExpiration(new Date(System.currentTimeMillis() + 86400000))
+            .signWith(SignatureAlgorithm.HS256, secret)
+            .compact();
+    }
+
+    public Claims extractClaims(String token) {
+        return Jwts.parser().setSigningKey(secret).parseClaimsJws(token).getBody();
+    }
+}
+
+// JwtFilter.java
+@Component
+public class JwtFilter extends OncePerRequestFilter {
+    @Autowired private JwtUtil jwtUtil;
+    @Autowired private UserRepository userRepo;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            String token = authHeader.substring(7);
+            Claims claims = jwtUtil.extractClaims(token);
+            String username = claims.getSubject();
+            User user = userRepo.findByUsername(username).get();
+            UsernamePasswordAuthenticationToken auth = new UsernamePasswordAuthenticationToken(
+                username, null, List.of(new SimpleGrantedAuthority("ROLE_" + user.getRole()))
+            );
+            SecurityContextHolder.getContext().setAuthentication(auth);
+        }
+        chain.doFilter(request, response);
+    }
+}
+
+// SecurityConfig.java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig extends WebSecurityConfigurerAdapter {
+    @Autowired private JwtFilter jwtFilter;
+
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http.csrf().disable()
+            .authorizeRequests()
+            .antMatchers("/api/auth/", "/h2-console/").permitAll()
+            .antMatchers("/api/bookings/").hasAnyRole("USER", "ADMIN")
+            .and().sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS);
+        http.headers().frameOptions().disable();
+        http.addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+    }
+}
+
+// AuthRequest.java
+@Data
+public class AuthRequest {
+    private String username;
+    private String password;
+}
